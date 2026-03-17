@@ -1,283 +1,163 @@
 ---
-name: pinchtab-browser-automation
-description: Use PinchTab to browse the web, inspect authenticated pages, and interact with websites through an orchestrator, browser instances, and tabs. Prefer this for durable browser automation, repeated workflows, and login-preserving tasks.
+name: pinchtab-browser
+description: Browse the web with a real Chrome browser. Read pages, click elements, fill forms, take screenshots, and maintain authenticated sessions. Token-efficient — use this instead of screenshots for most web tasks.
 ---
 
-# PinchTab Browser Automation
+# PinchTab Browser Skill
 
-PinchTab is a browser-control layer for agents. It runs a local orchestrator, manages browser instances, and exposes a tab-scoped HTTP API for reading and interacting with pages.
+PinchTab gives you a real Chrome browser controlled via HTTP. Use it when you need to:
 
-This skill standardizes on the current orchestrator workflow:
+- read pages that require JavaScript rendering
+- interact with forms, buttons, and links
+- maintain authenticated sessions (login once, reuse later)
+- take screenshots or export PDFs
+- scrape content that plain HTTP fetch can't handle
 
-1. start PinchTab
-2. create or reuse an instance
-3. open a tab
-4. inspect with `text`, `snapshot`, or `find`
-5. interact through stable refs with `action`
-6. capture output with screenshots or PDFs when needed
+Do NOT use this for simple public pages — plain fetch is cheaper and faster.
 
-## When To Use This Skill
-
-Use this skill when the task requires:
-
-- reading rendered pages
-- handling authenticated websites
-- repeating browser workflows with persistent state
-- interacting with forms, buttons, links, and dashboards
-- capturing screenshots or PDFs from a real browser
-
-Do not use this skill for simple public pages when plain HTTP fetch is enough.
-
-## Mental Model
-
-### Orchestrator
-
-The orchestrator runs with:
+## Check If PinchTab Is Running
 
 ```bash
-pinchtab
+curl -s http://127.0.0.1:9867/health
 ```
 
-Default base URL:
-
-```text
-http://127.0.0.1:9867
-```
-
-It manages browser instances and exposes the dashboard.
-
-### Instance
-
-An instance is a real Chrome process with isolated state:
-
-- cookies
-- local storage
-- history
-- tabs
-
-Instances can be:
-
-- headless
-- headed
-- backed by a persistent profile
-
-### Tab
-
-Tabs are the main execution surface.
-
-The most important tab routes are:
-
-- `GET /tabs/<tabId>/text`
-- `GET /tabs/<tabId>/snapshot`
-- `POST /tabs/<tabId>/find`
-- `POST /tabs/<tabId>/action`
-- `GET /tabs/<tabId>/screenshot`
-- `GET /tabs/<tabId>/pdf`
-
-## Quick Workflow
-
-### 1. Check Health
+If not running:
 
 ```bash
-curl http://127.0.0.1:9867/health
+CHROME_BINARY=~/.pinchtab/chrome-wrapper.sh bash scripts/start-pinchtab.sh --no-xvfb
 ```
 
-If PinchTab is not running:
+## Core Workflow
+
+### 1. Navigate
 
 ```bash
-bash scripts/start-pinchtab.sh
-```
-
-### 2. Create an Instance
-
-```bash
-INST=$(pinchtab instance launch --mode headless | jq -r '.id')
-sleep 2
-```
-
-If you need a reusable authenticated session, create or reuse a profile.
-
-### 3. Open a Tab
-
-```bash
-TAB=$(curl -s -X POST http://127.0.0.1:9867/instances/$INST/tabs/open \
+curl -s -X POST http://127.0.0.1:9867/navigate \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com"}' | jq -r '.id // .tabId')
+  -d '{"url":"https://example.com"}'
 ```
 
-### 4. Inspect The Page
-
-Prefer these in order:
-
-1. `text`
-2. `snapshot?interactive=true&compact=true`
-3. `find`
-4. full `snapshot`
-5. screenshot
-
-Examples:
+Or via CLI:
 
 ```bash
-curl "http://127.0.0.1:9867/tabs/$TAB/text"
-curl "http://127.0.0.1:9867/tabs/$TAB/snapshot?interactive=true&compact=true"
-curl -X POST "http://127.0.0.1:9867/tabs/$TAB/find" \
+pinchtab nav https://example.com
+```
+
+### 2. Read the Page
+
+Prefer these in order (cheapest first):
+
+```bash
+# Text extraction (~few hundred tokens)
+pinchtab text
+
+# Interactive elements only, compact (~<1000 tokens)
+pinchtab snap -i -c
+
+# Full accessibility tree (~3000 tokens)
+pinchtab snap
+
+# Screenshot (only when layout matters)
+pinchtab ss -o /tmp/page.jpg
+```
+
+### 3. Interact
+
+Elements are referenced by `ref` IDs from the snapshot (e.g., `e5`, `e12`).
+
+```bash
+pinchtab click e5
+pinchtab type e12 "search query"
+pinchtab fill e3 "user@example.com"
+pinchtab press Enter
+pinchtab hover e8
+pinchtab select e10 "option-value"
+pinchtab scroll e5
+```
+
+After every interaction, re-read with `text` or `snap -i -c` to verify the result.
+
+### 4. Run JavaScript
+
+```bash
+pinchtab eval "document.title"
+pinchtab eval "document.querySelector('.price').textContent"
+```
+
+### 5. Export
+
+```bash
+pinchtab ss -o /tmp/screenshot.jpg
+pinchtab pdf -o /tmp/page.pdf
+```
+
+## HTTP API Reference
+
+All routes on the server port (default 9867). For multi-instance, use the instance's own port.
+
+```bash
+# Navigation
+POST /navigate                        {"url":"https://..."}
+
+# Reading
+GET  /text                            Readable text (add ?raw=true for unprocessed)
+GET  /snapshot                        Accessibility tree
+GET  /snapshot?interactive=true&compact=true   Interactive elements only
+
+# Interaction
+POST /action                          {"kind":"click","ref":"e5"}
+POST /action                          {"kind":"type","ref":"e12","text":"hello"}
+POST /action                          {"kind":"fill","ref":"e3","text":"value"}
+POST /action                          {"kind":"press","ref":"","text":"Enter"}
+
+# JavaScript
+POST /evaluate                        {"expression":"document.title"}
+
+# Artifacts
+GET  /screenshot?raw=true             JPEG binary
+GET  /pdf?raw=true                    PDF binary
+
+# Management
+GET  /health                          Server status
+GET  /tabs                            List open tabs
+```
+
+## Multi-Instance (Isolated Sessions)
+
+Launch separate Chrome instances for parallel or authenticated work:
+
+```bash
+# Launch
+curl -s -X POST http://127.0.0.1:9867/instances/launch \
   -H "Content-Type: application/json" \
-  -d '{"query":"submit button"}'
-```
+  -d '{"name":"mybot","port":"9868","headless":true}'
 
-### 5. Interact
-
-```bash
-curl -X POST http://127.0.0.1:9867/tabs/$TAB/action \
+# Use it (same routes, different port)
+curl -s -X POST http://127.0.0.1:9868/navigate \
   -H "Content-Type: application/json" \
-  -d '{"kind":"click","ref":"e5"}'
+  -d '{"url":"https://example.com"}'
+
+curl -s http://127.0.0.1:9868/text
+
+# List running instances
+curl -s http://127.0.0.1:9867/instances
+
+# Stop
+curl -s -X POST http://127.0.0.1:9867/instances/mybot-9868/stop
 ```
 
-Common actions:
+## Authenticated Browsing
 
-- `click`
-- `type`
-- `fill`
-- `press`
-- `hover`
-- `select`
-- `focus`
+1. Launch an instance with a name (creates a persistent profile)
+2. Log in (via headed mode + dashboard, or by navigating and filling forms)
+3. Stop the instance
+4. Re-launch with the same name later — cookies and sessions persist in `~/.pinchtab/profiles/<name>/`
 
-### 6. Verify
+## Heuristics
 
-After every mutation:
-
-- re-read with `snapshot` or `text`
-- only use screenshots when structural verification is not enough
-
-## Authenticated Work
-
-Preferred approach:
-
-1. create a persistent profile
-2. start a headed instance with that profile
-3. log in once
-4. stop the instance
-5. restart the same profile later
-
-This is the main upstream model for keeping sessions alive.
-
-### Cookie Import
-
-Cookie import is still useful as a practical fallback if a user already has authenticated cookies in another browser, but it is not the primary workflow this skill emphasizes.
-
-Use profiles first.
-
-## Helpful Commands
-
-### Launch
-
-```bash
-bun run scripts/pinchtab-client.ts launch --mode headless
-bun run scripts/pinchtab-client.ts launch --mode headed --profile-id <profileId>
-```
-
-### Open/Navigate
-
-```bash
-bun run scripts/pinchtab-client.ts open <instanceId> https://example.com
-bun run scripts/pinchtab-client.ts navigate-tab <tabId> https://example.com/next
-```
-
-### Read
-
-```bash
-bun run scripts/pinchtab-client.ts text <tabId>
-bun run scripts/pinchtab-client.ts text <tabId> --raw
-bun run scripts/pinchtab-client.ts snapshot <tabId> --interactive --compact
-```
-
-### Act
-
-```bash
-bun run scripts/pinchtab-client.ts click <tabId> e5
-bun run scripts/pinchtab-client.ts type <tabId> e3 "hello"
-bun run scripts/pinchtab-client.ts fill <tabId> e3 "user@example.com"
-```
-
-### Search / Ref Recovery
-
-```bash
-bun run scripts/pinchtab-client.ts find <tabId> "login button"
-```
-
-### Evaluate
-
-```bash
-bun run scripts/pinchtab-client.ts eval <instanceId> "document.title"
-```
-
-### Artifacts
-
-```bash
-bun run scripts/pinchtab-client.ts screenshot <tabId> /tmp/page.jpg
-bun run scripts/pinchtab-client.ts pdf <tabId> /tmp/page.pdf
-```
-
-## Practical Heuristics
-
-### Default Reading Strategy
-
-- `text` for content
-- compact interactive `snapshot` for actions
-- `find` when the right ref is not obvious
-
-### When To Use Headed Mode
-
-Use headed mode when:
-
-- the site behaves differently under headless mode
-- you need to watch the login flow
-- debugging selectors or page transitions matters
-
-### When To Use Screenshots
-
-Use screenshots only when:
-
-- layout matters
-- visual confirmation matters
-- `text` and `snapshot` are insufficient
-
-### Cleanup
-
-Stop instances you no longer need.
-
-If you started the orchestrator with the helper scripts, stop it with:
-
-```bash
-bash scripts/stop-pinchtab.sh
-```
-
-## Security
-
-PinchTab gives full control of a real browser session.
-
-Treat these as sensitive:
-
-- profile directories
-- screenshots and PDFs from private pages
-- exported cookies
-- any remote PinchTab endpoint
-
-If exposing PinchTab remotely, use an auth token and network restrictions.
-
-## Important Upstream Notes
-
-Current PinchTab docs show both:
-
-- top-level shorthand routes like `/navigate`, `/text`, `/action`
-- orchestrator routes like `/instances/*` and `/tabs/*`
-
-This skill prefers orchestrator routes for durable agent work.
-
-Also note:
-
-- docs prominently use `BRIDGE_TOKEN`
-- the marketing site mentions `PINCHTAB_TOKEN`
-
-This skill follows the orchestrator docs naming.
+- Always try `text` first — it's the cheapest read
+- Use `snap -i -c` when you need to find clickable elements
+- Only use screenshots when visual layout matters
+- After clicking/typing, always re-read to verify the page changed
+- Use `eval` for precise data extraction when DOM selectors are known
+- Stop instances you no longer need

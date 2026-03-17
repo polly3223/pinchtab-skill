@@ -1,377 +1,240 @@
 # PinchTab Skill
 
-PinchTab is a lightweight browser-control layer for AI agents: a small binary that launches Chrome and exposes a token-efficient HTTP API.
+[PinchTab](https://pinchtab.com/) is a 12 MB Go binary that launches Chrome and exposes a token-efficient HTTP + CLI interface for AI agents. No config, no dependencies — just install and go.
 
-This repo packages the current PinchTab workflow for agent use:
+This repo wraps PinchTab into a ready-to-use skill for AI agent workflows (Claude, Codex, etc.). It includes:
 
-- start the PinchTab orchestrator
-- create isolated browser instances
-- open tabs inside those instances
-- read pages with `text` or `snapshot`
-- interact with pages through stable element refs
-- keep authenticated browser state alive through persistent profiles
+- helper scripts to install, start, and stop PinchTab on a Linux server
+- a Bun CLI client that covers the full HTTP API
+- a `SKILL.md` that agents can read to learn the workflow
+- tested and verified against PinchTab v0.7.6
 
-This refresh aligns the repo with the current PinchTab docs as of March 17, 2026.
+## Why PinchTab
 
-## What This Repo Gives You
+| Approach | Tokens |
+|----------|--------|
+| Full browser snapshot | ~10,000 |
+| PinchTab snapshot (no filter) | ~3,000 |
+| PinchTab snapshot (interactive + compact) | <1,000 |
+| Plain HTTP fetch (no JS) | ~2,000 |
 
-- a clearer mental model for PinchTab's current architecture
-- an updated `SKILL.md` for Claude/Codex-style agent workflows
-- helper scripts to start and stop the PinchTab orchestrator on a server
-- a zero-dependency Bun CLI for the PinchTab HTTP API
-- a better README for sharing the experiment internally
-
-## Current PinchTab Model
-
-The official docs currently show two ways of thinking about PinchTab:
-
-1. Quick single-browser shorthand
-   - CLI like `pinchtab nav`, `pinchtab snap -i -c`, `pinchtab text`
-   - HTTP routes like `/navigate`, `/snapshot`, `/text`, `/action`
-
-2. Orchestrator + instances + tabs
-   - start the orchestrator with `pinchtab`
-   - create browser instances with `pinchtab instance launch`
-   - open tabs in a specific instance
-   - operate on tabs through `/tabs/<tabId>/*`
-
-For agent workflows, this repo standardizes on the second model:
-
-- `pinchtab` runs the orchestrator on port `9867`
-- each instance is a real isolated Chrome process
-- each tab is the execution surface
-- authenticated state lives in profiles, not in ad-hoc cookies alone
-
-That model is more durable for:
-
-- repeated automations
-- multiple sessions
-- authenticated browsing
-- future multi-agent coordination
+PinchTab gives you a real browser (JS rendering, cookies, auth sessions) at near-fetch token cost.
 
 ## Quick Start
 
-### 1. Install PinchTab
+### 1. Install
 
-Official install:
+```bash
+bash scripts/install-deps.sh
+```
+
+Installs PinchTab, Google Chrome, and Xvfb (on apt-based Linux). Or install manually:
 
 ```bash
 curl -fsSL https://pinchtab.com/install.sh | bash
-pinchtab --version
 ```
 
-If you are on a Linux server and want headed debugging, make sure Chrome and Xvfb are available too.
-
-### 2. Start the Orchestrator
+### 2. Start the Server
 
 ```bash
 bash scripts/start-pinchtab.sh
 ```
 
-This starts the orchestrator on `http://127.0.0.1:9867` and prints connection info as JSON.
+Starts PinchTab on `http://127.0.0.1:9867`. Outputs JSON with health URL, dashboard URL, PIDs.
 
-### 3. Launch an Instance
+On Linux servers where Chrome needs `--no-sandbox`, set `CHROME_BINARY` to point to a wrapper:
 
 ```bash
-INST=$(bun run scripts/pinchtab-client.ts launch --mode headless | jq -r '.id')
+# Create wrapper (one-time)
+mkdir -p ~/.pinchtab
+cat > ~/.pinchtab/chrome-wrapper.sh << 'EOF'
+#!/bin/bash
+exec /usr/bin/google-chrome-stable --no-sandbox --disable-gpu "$@"
+EOF
+chmod +x ~/.pinchtab/chrome-wrapper.sh
+
+# Start with wrapper
+CHROME_BINARY=~/.pinchtab/chrome-wrapper.sh bash scripts/start-pinchtab.sh
 ```
 
-Or directly with the CLI:
+### 3. Browse a Page
 
 ```bash
-INST=$(pinchtab instance launch --mode headless | jq -r '.id')
+# Navigate
+pinchtab nav https://news.ycombinator.com
+
+# Read text (token-efficient)
+pinchtab text
+
+# Get interactive elements
+pinchtab snap -i -c
+
+# Click an element
+pinchtab click e5
+
+# Type into an input
+pinchtab type e12 "search query"
+
+# Screenshot
+pinchtab ss -o /tmp/page.jpg
 ```
 
-### 4. Open a Tab
+### 4. Stop
 
 ```bash
-bun run scripts/pinchtab-client.ts open "$INST" https://example.com
+bash scripts/stop-pinchtab.sh
 ```
 
-Response includes the `tabId`.
+## How It Works
 
-### 5. Read the Page
+### Single-Browser Mode (Default)
 
-```bash
-bun run scripts/pinchtab-client.ts text <tabId>
-bun run scripts/pinchtab-client.ts snapshot <tabId> --interactive --compact
-```
+`pinchtab` starts a server on port 9867 with one Chrome instance. You interact via shorthand routes:
 
-### 6. Interact with the Page
+| Route | Method | Description |
+|-------|--------|-------------|
+| `/health` | GET | Server status |
+| `/navigate` | POST | Go to URL (`{"url":"..."}`) |
+| `/text` | GET | Readable text extraction |
+| `/snapshot` | GET | Accessibility tree |
+| `/action` | POST | Click, type, fill, press, hover, select, focus, scroll |
+| `/screenshot` | GET | JPEG screenshot (`?raw=true` for binary) |
+| `/pdf` | GET | PDF export (`?raw=true` for binary) |
+| `/evaluate` | POST | Run JavaScript (`{"expression":"..."}`) |
+| `/tabs` | GET | List open tabs |
 
-```bash
-bun run scripts/pinchtab-client.ts click <tabId> e5
-bun run scripts/pinchtab-client.ts fill <tabId> e3 "hello@example.com"
-```
+### Multi-Instance Mode
 
-### 7. Stop the Instance
-
-```bash
-bun run scripts/pinchtab-client.ts stop "$INST"
-```
-
-## Architecture
-
-### Orchestrator
-
-Start it with:
+For isolated sessions (e.g., different logins), launch named instances:
 
 ```bash
-pinchtab
-```
-
-Responsibilities:
-
-- listens on port `9867` by default
-- manages running instances
-- exposes the dashboard
-- routes requests to instance- and tab-scoped APIs
-
-### Instance
-
-An instance is a real Chrome browser process:
-
-- isolated cookies, history, and storage
-- can be headless or headed
-- can use a persistent profile
-- can contain one or more tabs
-
-### Tab
-
-A tab is the surface you actually automate:
-
-- `snapshot` for structure
-- `text` for token-efficient reading
-- `action` for click/type/fill/press/hover/select/focus
-- `screenshot` and `pdf` for artifacts
-
-## Recommended Agent Workflow
-
-### Fast Read-Only Task
-
-Use:
-
-- `text`
-- `snapshot?interactive=true&compact=true`
-
-Avoid screenshots unless you truly need pixels.
-
-### Authenticated Task
-
-Use:
-
-1. a persistent profile
-2. a headed instance for the first login
-3. restart that same profile later for reuse
-
-Official docs emphasize profile persistence. That should be your default mental model.
-
-### Cookie Import
-
-Cookie import is still a useful practical trick when you already have authenticated cookies from another browser, but it should be treated as a convenience workflow rather than the core PinchTab model.
-
-Use profiles first.
-
-## Current HTTP Surface We Standardize On
-
-### Health
-
-```bash
-curl http://127.0.0.1:9867/health
-```
-
-### Launch Instance
-
-```bash
+# Launch an instance (gets its own Chrome + port)
 curl -X POST http://127.0.0.1:9867/instances/launch \
   -H "Content-Type: application/json" \
-  -d '{"mode":"headless"}'
-```
+  -d '{"name":"scraper","port":"9868","headless":true}'
 
-Notes:
-
-- some current docs also show `POST /instances/start` when launching from a profile
-- this repo supports both when practical
-
-### Open Tab
-
-```bash
-curl -X POST http://127.0.0.1:9867/instances/<instanceId>/tabs/open \
+# Talk to the instance on its own port — same shorthand routes
+curl -X POST http://127.0.0.1:9868/navigate \
   -H "Content-Type: application/json" \
   -d '{"url":"https://example.com"}'
+
+curl http://127.0.0.1:9868/text
+
+# List / stop instances
+curl http://127.0.0.1:9867/instances
+curl -X POST http://127.0.0.1:9867/instances/scraper-9868/stop
 ```
 
-### Read Text
+Each instance gets its own profile directory (`~/.pinchtab/profiles/<name>/`) for persistent cookies and sessions.
+
+### Authenticated Browsing
+
+1. Start a headed instance (needs Xvfb on servers)
+2. Log in via the PinchTab dashboard screencast
+3. Stop the instance
+4. Restart with the same profile name later — session persists
+
+## CLI Reference
+
+```
+pinchtab nav <url>                     Navigate to URL
+pinchtab text [--raw]                  Extract readable text
+pinchtab snap [-i] [-c] [-d]          Accessibility tree snapshot
+pinchtab click <ref>                   Click element by ref (e.g., e5)
+pinchtab type <ref> <text>             Type into element
+pinchtab fill <ref|selector> <text>    Fill input directly
+pinchtab press <key>                   Press key (Enter, Tab, Escape...)
+pinchtab hover <ref>                   Hover element
+pinchtab scroll <ref|pixels>           Scroll to element or by pixels
+pinchtab select <ref> <value>          Select dropdown option
+pinchtab focus <ref>                   Focus element
+pinchtab tabs [new <url>|close <id>]   Manage tabs
+pinchtab ss [-o file] [-q 80]          Screenshot (JPEG)
+pinchtab pdf [-o file] [--landscape]   Export page as PDF
+pinchtab eval <expression>             Run JavaScript
+pinchtab health                        Check server status
+```
+
+Snapshot flags: `-i` interactive only, `-c` compact, `-d` diff since last, `-s <css>` scope to selector, `--max-tokens N`, `--depth N`, `--tab <id>`.
+
+## Bun Client
+
+A zero-dependency Bun CLI that wraps the HTTP API:
 
 ```bash
-curl "http://127.0.0.1:9867/tabs/<tabId>/text"
-curl "http://127.0.0.1:9867/tabs/<tabId>/text?raw=true"
+bun run scripts/pinchtab-client.ts health
+bun run scripts/pinchtab-client.ts launch --name scraper --port 9868
+bun run scripts/pinchtab-client.ts navigate 9868 https://example.com
+bun run scripts/pinchtab-client.ts text 9868
+bun run scripts/pinchtab-client.ts snapshot 9868 --interactive --compact
+bun run scripts/pinchtab-client.ts click 9868 e5
+bun run scripts/pinchtab-client.ts screenshot 9868 /tmp/page.jpg
+bun run scripts/pinchtab-client.ts stop scraper-9868
+bun run scripts/pinchtab-client.ts list-instances
 ```
 
-### Read Snapshot
-
-```bash
-curl "http://127.0.0.1:9867/tabs/<tabId>/snapshot"
-curl "http://127.0.0.1:9867/tabs/<tabId>/snapshot?interactive=true&compact=true"
-```
-
-### Find a Likely Ref
-
-```bash
-curl -X POST http://127.0.0.1:9867/tabs/<tabId>/find \
-  -H "Content-Type: application/json" \
-  -d '{"query":"login button"}'
-```
-
-### Interact
-
-```bash
-curl -X POST http://127.0.0.1:9867/tabs/<tabId>/action \
-  -H "Content-Type: application/json" \
-  -d '{"kind":"click","ref":"e5"}'
-```
-
-Other common actions:
-
-- `type`
-- `fill`
-- `press`
-- `hover`
-- `select`
-- `focus`
-
-### Evaluate JavaScript
-
-```bash
-curl -X POST http://127.0.0.1:9867/instances/<instanceId>/evaluate \
-  -H "Content-Type: application/json" \
-  -d '{"expression":"document.title"}'
-```
-
-### Export Artifacts
-
-```bash
-curl "http://127.0.0.1:9867/tabs/<tabId>/screenshot?raw=true" > page.jpg
-curl "http://127.0.0.1:9867/tabs/<tabId>/pdf?raw=true" > page.pdf
-```
+Defaults to the main server port (9867). Pass a port number to target a specific instance.
 
 ## Scripts
 
-### `scripts/install-deps.sh`
+| Script | Description |
+|--------|-------------|
+| `scripts/install-deps.sh` | Install PinchTab + Chrome + Xvfb |
+| `scripts/start-pinchtab.sh` | Start server, Xvfb, optional tunnel |
+| `scripts/stop-pinchtab.sh` | Stop all managed processes |
+| `scripts/pinchtab-client.ts` | Bun HTTP client for the API |
 
-Installs or verifies:
+### start-pinchtab.sh Options
 
-- PinchTab
-- Chrome on apt-based Linux hosts
-- Xvfb for headed server workflows
-- optional `cloudflared`
+```bash
+bash scripts/start-pinchtab.sh              # default: start with Xvfb
+bash scripts/start-pinchtab.sh --no-xvfb    # skip Xvfb (headless only)
+bash scripts/start-pinchtab.sh --tunnel      # also start cloudflared tunnel
+```
 
-### `scripts/start-pinchtab.sh`
+Environment overrides: `BRIDGE_PORT`, `BRIDGE_BIND`, `BRIDGE_TOKEN`, `CHROME_BINARY`, `PINCHTAB_START_XVFB`, `PINCHTAB_START_TUNNEL`.
 
-Starts:
+## Environment Variables
 
-- Xvfb on `:99` when requested
-- the PinchTab orchestrator
-- an optional Cloudflare quick tunnel
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PINCHTAB_URL` | `http://127.0.0.1:9867` | Server URL (for CLI) |
+| `PINCHTAB_TOKEN` | — | Auth token (CLI) |
+| `BRIDGE_PORT` | `9867` | Server port |
+| `BRIDGE_BIND` | `127.0.0.1` | Bind address |
+| `BRIDGE_TOKEN` | — | Auth token (server) |
+| `BRIDGE_HEADLESS` | `true` | Run Chrome headless |
+| `CHROME_BINARY` | — | Path to Chrome binary or wrapper |
 
-Outputs JSON with:
+## Security
 
-- local health URL
-- dashboard URL
-- local port
-- optional public tunnel URL
+PinchTab controls a real browser with real login sessions. Treat as sensitive:
 
-### `scripts/stop-pinchtab.sh`
-
-Stops the processes created by `start-pinchtab.sh`.
-
-### `scripts/pinchtab-client.ts`
-
-Zero-dependency Bun CLI around the current PinchTab HTTP API.
-
-Supported commands:
-
-- `health`
-- `launch`
-- `list-instances`
-- `list-tabs`
-- `open`
-- `navigate-tab`
-- `text`
-- `snapshot`
-- `find`
-- `click`
-- `type`
-- `fill`
-- `eval`
-- `cookies`
-- `screenshot`
-- `pdf`
-- `stop`
-
-## Security Notes
-
-PinchTab controls a real browser with real login sessions.
-
-Treat these as sensitive:
-
-- profile directories
-- screenshots and PDFs from private sites
+- profile directories (`~/.pinchtab/profiles/`)
+- screenshots and PDFs from private pages
 - exported cookies
-- any remote PinchTab endpoint exposed beyond localhost
+- any PinchTab endpoint exposed beyond localhost
 
-If you expose PinchTab remotely:
-
-- set an auth token
-- restrict who can reach it
-- use low-risk accounts first
-
-The upstream site mentions `PINCHTAB_TOKEN`, while the docs and build examples prominently use `BRIDGE_TOKEN`.
-
-For now, this repo follows the documented orchestrator environment names:
-
-- `BRIDGE_PORT`
-- `BRIDGE_BIND`
-- `BRIDGE_TOKEN`
-
-## Upstream Docs Reality Check
-
-PinchTab is moving fast, and the current official docs show a few parallel patterns at once:
-
-- top-level shorthand routes
-- orchestrator + instances + tabs
-- `instances/launch`
-- `instances/start` in some profile examples
-
-This repo makes one opinionated choice:
-
-- prefer the orchestrator + instance + tab model for serious agent workflows
-
-That keeps the repo internally coherent even if upstream examples vary.
+If exposing remotely: set `BRIDGE_TOKEN`, restrict network access, start with low-risk accounts.
 
 ## Repo Layout
 
-```text
+```
 pinchtab-skill/
-├── README.md
-├── SKILL.md
+├── README.md                    # This file
+├── SKILL.md                     # Agent-readable skill definition
 └── scripts/
-    ├── browser-connect.ts      # compatibility wrapper
-    ├── install-deps.sh
-    ├── launch-browser.sh       # compatibility wrapper
-    ├── pinchtab-client.ts
-    ├── start-pinchtab.sh
-    ├── stop-browser.sh         # compatibility wrapper
-    └── stop-pinchtab.sh
+    ├── install-deps.sh          # Dependency installer
+    ├── pinchtab-client.ts       # Bun HTTP API client
+    ├── start-pinchtab.sh        # Start server + Xvfb + tunnel
+    └── stop-pinchtab.sh         # Stop managed processes
 ```
 
-## Official Sources
+## Links
 
-- Repo: https://github.com/polly3223/pinchtab-skill
-- Site: https://pinchtab.com/
-- Docs: https://pinchtab.com/docs/
-- Getting started: https://pinchtab.com/docs/get-started
-- Tabs reference: https://pinchtab.com/docs/tabs/
+- [PinchTab website](https://pinchtab.com/)
+- [PinchTab docs](https://pinchtab.com/docs/)
+- [PinchTab GitHub](https://github.com/nickvdyck/pinchtab)
 
 ## License
 

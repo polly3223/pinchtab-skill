@@ -10,6 +10,26 @@ BIND="${BRIDGE_BIND:-127.0.0.1}"
 START_XVFB="${PINCHTAB_START_XVFB:-1}"
 START_TUNNEL="${PINCHTAB_START_TUNNEL:-0}"
 
+# Auto-detect CHROME_BINARY on Linux if not set.
+# PinchTab may pick up a Snap Chromium by default, which fails on servers.
+# Prefer google-chrome-stable with a --no-sandbox wrapper.
+if [ -z "${CHROME_BINARY:-}" ] && [ "$(uname -s)" = "Linux" ]; then
+  WRAPPER="$HOME/.pinchtab/chrome-wrapper.sh"
+  if [ -x "$WRAPPER" ]; then
+    export CHROME_BINARY="$WRAPPER"
+  elif command -v google-chrome-stable >/dev/null 2>&1; then
+    # Create wrapper automatically
+    mkdir -p "$HOME/.pinchtab"
+    cat > "$WRAPPER" << 'WRAPEOF'
+#!/bin/bash
+exec /usr/bin/google-chrome-stable --no-sandbox --disable-gpu "$@"
+WRAPEOF
+    chmod +x "$WRAPPER"
+    export CHROME_BINARY="$WRAPPER"
+    echo "Created Chrome wrapper at $WRAPPER" >&2
+  fi
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --tunnel)
@@ -78,8 +98,8 @@ start_orchestrator() {
   if [ -n "${BRIDGE_TOKEN:-}" ]; then
     env_cmd+=("BRIDGE_TOKEN=$BRIDGE_TOKEN")
   fi
-  if [ -n "${CHROME_BIN:-}" ]; then
-    env_cmd+=("CHROME_BIN=$CHROME_BIN")
+  if [ -n "${CHROME_BINARY:-}" ]; then
+    env_cmd+=("CHROME_BINARY=$CHROME_BINARY")
   fi
   if [ -n "${DISPLAY:-}" ]; then
     env_cmd+=("DISPLAY=$DISPLAY")

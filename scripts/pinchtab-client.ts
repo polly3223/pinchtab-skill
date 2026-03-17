@@ -1,42 +1,67 @@
 #!/usr/bin/env bun
 
-const BASE_URL = process.env.PINCHTAB_BASE_URL || "http://127.0.0.1:9867";
+/**
+ * PinchTab HTTP API client.
+ * Zero dependencies — runs with `bun run`.
+ *
+ * By default talks to the main server on port 9867.
+ * For instance-scoped commands, pass a port number as the first arg
+ * and it targets http://127.0.0.1:<port> instead.
+ */
+
+const DEFAULT_PORT = 9867;
+const HOST = process.env.PINCHTAB_HOST || "127.0.0.1";
+
+function baseUrl(port: number): string {
+  return `http://${HOST}:${port}`;
+}
 
 function usage(): never {
-  console.error(`Usage:
+  console.error(`PinchTab Client — Bun HTTP wrapper for PinchTab API
+
+Server commands (port 9867):
+  health                                     Check server status
+  launch --name <n> --port <p> [--headless]  Launch a new instance
+  list-instances                             List running instances
+  stop <instanceId>                          Stop an instance
+
+Instance commands (pass port to target a specific instance):
+  navigate <port> <url>                      Navigate to URL
+  text <port> [--raw]                        Extract readable text
+  snapshot <port> [--interactive] [--compact] Accessibility tree
+  click <port> <ref>                         Click element
+  type <port> <ref> <text>                   Type into element
+  fill <port> <ref> <text>                   Fill input directly
+  eval <port> <expression>                   Run JavaScript
+  screenshot <port> [path]                   Save screenshot
+  pdf <port> [path]                          Save PDF
+  tabs <port>                                List open tabs
+
+Examples:
   bun run scripts/pinchtab-client.ts health
-  bun run scripts/pinchtab-client.ts launch [--mode headless|headed] [--profile-id <id>] [--port <port>]
-  bun run scripts/pinchtab-client.ts list-instances
-  bun run scripts/pinchtab-client.ts list-tabs [instanceId]
-  bun run scripts/pinchtab-client.ts open <instanceId> <url>
-  bun run scripts/pinchtab-client.ts navigate-tab <tabId> <url>
-  bun run scripts/pinchtab-client.ts text <tabId> [--raw]
-  bun run scripts/pinchtab-client.ts snapshot <tabId> [--interactive] [--compact]
-  bun run scripts/pinchtab-client.ts find <tabId> <query>
-  bun run scripts/pinchtab-client.ts click <tabId> <ref>
-  bun run scripts/pinchtab-client.ts type <tabId> <ref> <text>
-  bun run scripts/pinchtab-client.ts fill <tabId> <ref> <text>
-  bun run scripts/pinchtab-client.ts eval <instanceId> <expression>
-  bun run scripts/pinchtab-client.ts cookies <tabId>
-  bun run scripts/pinchtab-client.ts screenshot <tabId> [path]
-  bun run scripts/pinchtab-client.ts pdf <tabId> [path]
-  bun run scripts/pinchtab-client.ts stop <instanceId>`);
+  bun run scripts/pinchtab-client.ts launch --name scraper --port 9868
+  bun run scripts/pinchtab-client.ts navigate 9868 https://example.com
+  bun run scripts/pinchtab-client.ts text 9868
+  bun run scripts/pinchtab-client.ts snapshot 9868 --interactive --compact
+  bun run scripts/pinchtab-client.ts click 9868 e5
+  bun run scripts/pinchtab-client.ts stop scraper-9868`);
   process.exit(1);
 }
 
 async function request(
-  path: string,
+  url: string,
   init?: RequestInit,
 ): Promise<Response> {
   const headers = new Headers(init?.headers);
+  const token = process.env.PINCHTAB_TOKEN || process.env.BRIDGE_TOKEN;
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
-  const resp = await fetch(`${BASE_URL}${path}`, {
-    ...init,
-    headers,
-  });
+  const resp = await fetch(url, { ...init, headers });
 
   if (!resp.ok) {
     const text = await resp.text();
@@ -46,239 +71,166 @@ async function request(
   return resp;
 }
 
-async function json(path: string, init?: RequestInit): Promise<unknown> {
-  const resp = await request(path, init);
-  return await resp.json();
+async function json(url: string, init?: RequestInit): Promise<unknown> {
+  const resp = await request(url, init);
+  return resp.json();
 }
 
-async function writeBinary(path: string, outputPath: string): Promise<void> {
-  const resp = await request(path);
+async function writeBinary(url: string, outputPath: string): Promise<void> {
+  const resp = await request(url);
   const buffer = await resp.arrayBuffer();
   await Bun.write(outputPath, buffer);
-  console.log(JSON.stringify({ outputPath }, null, 2));
+  console.log(JSON.stringify({ outputPath, bytes: buffer.byteLength }));
 }
 
-async function launchInstance(body: Record<string, unknown>): Promise<void> {
-  const payload = JSON.stringify(body);
-
-  try {
-    const result = await json("/instances/launch", {
-      method: "POST",
-      body: payload,
-    });
-    console.log(JSON.stringify(result, null, 2));
-    return;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes("404")) {
-      throw error;
-    }
-  }
-
-  const result = await json("/instances/start", {
-    method: "POST",
-    body: payload,
-  });
-  console.log(JSON.stringify(result, null, 2));
+function out(data: unknown): void {
+  console.log(JSON.stringify(data, null, 2));
 }
 
 function parseFlag(name: string): string | undefined {
-  const index = process.argv.indexOf(name);
-  if (index === -1) return undefined;
-  return process.argv[index + 1];
+  const idx = process.argv.indexOf(name);
+  if (idx === -1) return undefined;
+  return process.argv[idx + 1];
 }
 
 function hasFlag(name: string): boolean {
   return process.argv.includes(name);
 }
 
-const command = process.argv[2];
-
-if (!command) {
-  usage();
+/** Parse a port number from argv at the given position. */
+function portArg(pos: number): number {
+  const val = process.argv[pos];
+  if (!val) usage();
+  const port = Number(val);
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid port: ${val}`);
+  }
+  return port;
 }
+
+const command = process.argv[2];
+if (!command) usage();
 
 try {
   switch (command) {
+    // ── Server commands (always on main port) ──────────────────────
+
     case "health": {
-      console.log(JSON.stringify(await json("/health"), null, 2));
+      out(await json(`${baseUrl(DEFAULT_PORT)}/health`));
       break;
     }
 
     case "launch": {
-      const mode = parseFlag("--mode");
-      const profileId = parseFlag("--profile-id");
+      const name = parseFlag("--name");
       const port = parseFlag("--port");
-      const body: Record<string, unknown> = {};
-      if (mode) body.mode = mode;
-      if (profileId) body.profileId = profileId;
-      if (port) body.port = Number(port);
-      await launchInstance(body);
+      if (!name || !port) {
+        console.error("launch requires --name and --port");
+        process.exit(1);
+      }
+      const body: Record<string, unknown> = {
+        name,
+        port,
+        headless: hasFlag("--headless") || !hasFlag("--headed"),
+      };
+      out(await json(`${baseUrl(DEFAULT_PORT)}/instances/launch`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }));
       break;
     }
 
     case "list-instances": {
-      console.log(JSON.stringify(await json("/instances"), null, 2));
-      break;
-    }
-
-    case "list-tabs": {
-      const instanceId = process.argv[3];
-      const path = instanceId ? `/instances/${instanceId}/tabs` : "/tabs";
-      console.log(JSON.stringify(await json(path), null, 2));
-      break;
-    }
-
-    case "open": {
-      const instanceId = process.argv[3];
-      const url = process.argv[4];
-      if (!instanceId || !url) usage();
-      console.log(
-        JSON.stringify(
-          await json(`/instances/${instanceId}/tabs/open`, {
-            method: "POST",
-            body: JSON.stringify({ url }),
-          }),
-          null,
-          2,
-        ),
-      );
-      break;
-    }
-
-    case "navigate-tab": {
-      const tabId = process.argv[3];
-      const url = process.argv[4];
-      if (!tabId || !url) usage();
-      console.log(
-        JSON.stringify(
-          await json(`/tabs/${tabId}/navigate`, {
-            method: "POST",
-            body: JSON.stringify({ url }),
-          }),
-          null,
-          2,
-        ),
-      );
-      break;
-    }
-
-    case "text": {
-      const tabId = process.argv[3];
-      if (!tabId) usage();
-      const raw = hasFlag("--raw");
-      const suffix = raw ? "?raw=true" : "";
-      console.log(JSON.stringify(await json(`/tabs/${tabId}/text${suffix}`), null, 2));
-      break;
-    }
-
-    case "snapshot": {
-      const tabId = process.argv[3];
-      if (!tabId) usage();
-      const params = new URLSearchParams();
-      if (hasFlag("--interactive")) params.set("interactive", "true");
-      if (hasFlag("--compact")) params.set("compact", "true");
-      const suffix = params.size ? `?${params.toString()}` : "";
-      console.log(
-        JSON.stringify(await json(`/tabs/${tabId}/snapshot${suffix}`), null, 2),
-      );
-      break;
-    }
-
-    case "find": {
-      const tabId = process.argv[3];
-      const query = process.argv.slice(4).join(" ");
-      if (!tabId || !query) usage();
-      console.log(
-        JSON.stringify(
-          await json(`/tabs/${tabId}/find`, {
-            method: "POST",
-            body: JSON.stringify({ query }),
-          }),
-          null,
-          2,
-        ),
-      );
-      break;
-    }
-
-    case "click":
-    case "type":
-    case "fill": {
-      const tabId = process.argv[3];
-      const ref = process.argv[4];
-      const text = process.argv.slice(5).join(" ");
-      if (!tabId || !ref) usage();
-
-      const body: Record<string, string> = { kind: command, ref };
-      if ((command === "type" || command === "fill") && !text) usage();
-      if (text) body.text = text;
-
-      console.log(
-        JSON.stringify(
-          await json(`/tabs/${tabId}/action`, {
-            method: "POST",
-            body: JSON.stringify(body),
-          }),
-          null,
-          2,
-        ),
-      );
-      break;
-    }
-
-    case "eval": {
-      const instanceId = process.argv[3];
-      const expression = process.argv.slice(4).join(" ");
-      if (!instanceId || !expression) usage();
-      console.log(
-        JSON.stringify(
-          await json(`/instances/${instanceId}/evaluate`, {
-            method: "POST",
-            body: JSON.stringify({ expression }),
-          }),
-          null,
-          2,
-        ),
-      );
-      break;
-    }
-
-    case "cookies": {
-      const tabId = process.argv[3];
-      if (!tabId) usage();
-      console.log(JSON.stringify(await json(`/tabs/${tabId}/cookies`), null, 2));
-      break;
-    }
-
-    case "screenshot": {
-      const tabId = process.argv[3];
-      const outputPath = process.argv[4] || "/tmp/pinchtab-screenshot.jpg";
-      if (!tabId) usage();
-      await writeBinary(`/tabs/${tabId}/screenshot?raw=true`, outputPath);
-      break;
-    }
-
-    case "pdf": {
-      const tabId = process.argv[3];
-      const outputPath = process.argv[4] || "/tmp/pinchtab-page.pdf";
-      if (!tabId) usage();
-      await writeBinary(`/tabs/${tabId}/pdf?raw=true`, outputPath);
+      out(await json(`${baseUrl(DEFAULT_PORT)}/instances`));
       break;
     }
 
     case "stop": {
       const instanceId = process.argv[3];
       if (!instanceId) usage();
-      console.log(
-        JSON.stringify(
-          await json(`/instances/${instanceId}/stop`, {
-            method: "POST",
-          }),
-          null,
-          2,
-        ),
-      );
+      out(await json(`${baseUrl(DEFAULT_PORT)}/instances/${instanceId}/stop`, {
+        method: "POST",
+      }));
+      break;
+    }
+
+    // ── Instance commands (port-scoped) ────────────────────────────
+
+    case "navigate": {
+      const port = portArg(3);
+      const url = process.argv[4];
+      if (!url) usage();
+      out(await json(`${baseUrl(port)}/navigate`, {
+        method: "POST",
+        body: JSON.stringify({ url }),
+      }));
+      break;
+    }
+
+    case "text": {
+      const port = portArg(3);
+      const raw = hasFlag("--raw");
+      const suffix = raw ? "?raw=true" : "";
+      out(await json(`${baseUrl(port)}/text${suffix}`));
+      break;
+    }
+
+    case "snapshot": {
+      const port = portArg(3);
+      const params = new URLSearchParams();
+      if (hasFlag("--interactive")) params.set("interactive", "true");
+      if (hasFlag("--compact")) params.set("compact", "true");
+      const suffix = params.size ? `?${params}` : "";
+      out(await json(`${baseUrl(port)}/snapshot${suffix}`));
+      break;
+    }
+
+    case "click":
+    case "type":
+    case "fill": {
+      const port = portArg(3);
+      const ref = process.argv[4];
+      const text = process.argv.slice(5).join(" ");
+      if (!ref) usage();
+
+      const body: Record<string, string> = { kind: command, ref };
+      if ((command === "type" || command === "fill") && !text) usage();
+      if (text) body.text = text;
+
+      out(await json(`${baseUrl(port)}/action`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }));
+      break;
+    }
+
+    case "eval": {
+      const port = portArg(3);
+      const expression = process.argv.slice(4).join(" ");
+      if (!expression) usage();
+      out(await json(`${baseUrl(port)}/evaluate`, {
+        method: "POST",
+        body: JSON.stringify({ expression }),
+      }));
+      break;
+    }
+
+    case "screenshot": {
+      const port = portArg(3);
+      const outputPath = process.argv[4] || "/tmp/pinchtab-screenshot.jpg";
+      await writeBinary(`${baseUrl(port)}/screenshot?raw=true`, outputPath);
+      break;
+    }
+
+    case "pdf": {
+      const port = portArg(3);
+      const outputPath = process.argv[4] || "/tmp/pinchtab-page.pdf";
+      await writeBinary(`${baseUrl(port)}/pdf?raw=true`, outputPath);
+      break;
+    }
+
+    case "tabs": {
+      const port = portArg(3);
+      out(await json(`${baseUrl(port)}/tabs`));
       break;
     }
 
