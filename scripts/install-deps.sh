@@ -1,54 +1,104 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== Browser Automation: Installing dependencies ==="
+echo "=== PinchTab Skill: install / verify dependencies ==="
 
-# x11vnc for VNC serving
-# novnc for web-based VNC client (includes websockify)
-sudo apt-get update -qq
-sudo apt-get install -y x11vnc novnc
+install_pinchtab() {
+  if command -v pinchtab >/dev/null 2>&1; then
+    echo "  ✓ pinchtab already installed: $(command -v pinchtab)"
+    return
+  fi
 
-# Ensure Playwright's Chromium has its system deps (libatk, libcups, etc.)
-bunx playwright install-deps chromium
+  echo "  → Installing PinchTab via official installer"
+  curl -fsSL https://pinchtab.com/install.sh | bash
+}
 
-# Verify all required binaries
-echo ""
-echo "=== Verifying binaries ==="
-MISSING=0
-for cmd in Xvfb x11vnc websockify cloudflared; do
-  if command -v "$cmd" &>/dev/null; then
-    echo "  ✓ $cmd found: $(command -v "$cmd")"
+install_linux_browser_deps() {
+  if [ "$(uname -s)" != "Linux" ]; then
+    echo "  → Non-Linux host detected, skipping apt-based Chrome/Xvfb install"
+    return
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1; then
+    echo "  → Linux host without sudo/apt-get, skipping Chrome/Xvfb install"
+    return
+  fi
+
+  local need_update=0
+  if ! command -v google-chrome-stable >/dev/null 2>&1; then
+    need_update=1
+  fi
+  if ! command -v Xvfb >/dev/null 2>&1; then
+    need_update=1
+  fi
+
+  if [ "$need_update" -eq 0 ]; then
+    echo "  ✓ Chrome + Xvfb already available"
+    return
+  fi
+
+  echo "  → Installing Chrome + Xvfb on apt-based Linux"
+  sudo mkdir -p /etc/apt/keyrings
+  if [ ! -f /etc/apt/keyrings/google-chrome.gpg ]; then
+    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+      | sudo gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+  fi
+
+  if [ ! -f /etc/apt/sources.list.d/google-chrome.list ]; then
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+      | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+  fi
+
+  sudo apt-get update -qq
+  sudo apt-get install -y google-chrome-stable xvfb
+}
+
+verify_optional() {
+  if command -v cloudflared >/dev/null 2>&1; then
+    echo "  ✓ cloudflared found: $(command -v cloudflared)"
   else
-    echo "  ✗ $cmd NOT FOUND"
-    MISSING=1
+    echo "  · cloudflared not found (optional; only needed for quick public tunnels)"
+  fi
+}
+
+install_pinchtab
+install_linux_browser_deps
+
+echo ""
+echo "=== Verification ==="
+
+missing=0
+for cmd in pinchtab; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "  ✓ $cmd: $(command -v "$cmd")"
+  else
+    echo "  ✗ missing: $cmd"
+    missing=1
   fi
 done
 
-# Verify Playwright Chromium binary
-CHROME_DIR="$HOME/.cache/ms-playwright"
-CHROME_BIN=$(find "$CHROME_DIR" -name "chrome" -path "*/chrome-linux64/*" 2>/dev/null | head -1)
-if [ -n "$CHROME_BIN" ] && [ -x "$CHROME_BIN" ]; then
-  echo "  ✓ Playwright Chromium: $CHROME_BIN"
+if command -v google-chrome-stable >/dev/null 2>&1; then
+  echo "  ✓ google-chrome-stable: $(command -v google-chrome-stable)"
+elif command -v chromium >/dev/null 2>&1; then
+  echo "  ✓ chromium: $(command -v chromium)"
+elif command -v chromium-browser >/dev/null 2>&1; then
+  echo "  ✓ chromium-browser: $(command -v chromium-browser)"
 else
-  echo "  ✗ Playwright Chromium not found in $CHROME_DIR"
-  echo "    Run: bunx playwright install chromium"
-  MISSING=1
+  echo "  · Chrome/Chromium not found"
 fi
 
-# Verify noVNC web files
-if [ -f /usr/share/novnc/vnc.html ]; then
-  echo "  ✓ noVNC web files: /usr/share/novnc/"
-elif [ -f /usr/share/novnc/vnc_lite.html ]; then
-  echo "  ✓ noVNC web files: /usr/share/novnc/ (lite only)"
+if command -v Xvfb >/dev/null 2>&1; then
+  echo "  ✓ Xvfb: $(command -v Xvfb)"
 else
-  echo "  ✗ noVNC web files not found at /usr/share/novnc/"
-  MISSING=1
+  echo "  · Xvfb not found (needed for headed workflows on headless Linux)"
 fi
+
+verify_optional
 
 echo ""
-if [ "$MISSING" -eq 0 ]; then
-  echo "=== All dependencies verified ✓ ==="
+if [ "$missing" -eq 0 ]; then
+  echo "=== Done ==="
 else
-  echo "=== Some dependencies missing — see above ==="
+  echo "=== Missing required dependencies ==="
   exit 1
 fi
