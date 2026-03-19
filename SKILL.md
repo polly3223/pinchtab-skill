@@ -28,6 +28,46 @@ metadata:
 
 PinchTab gives agents a browser they can drive through stable accessibility refs, low-token text extraction, and persistent profiles or instances. Treat it as a CLI-first browser skill; use the HTTP API only when the CLI is unavailable or you need profile-management routes that do not exist in the CLI yet.
 
+## Bootstrap (first-time setup)
+
+Before running any browser automation, verify that PinchTab and a browser are installed and the server is running. On a fresh Linux server none of these may be present.
+
+**Step 1 — Install dependencies (Linux only, requires sudo):**
+
+```bash
+bash scripts/install-deps.sh
+```
+
+This installs: `pinchtab`, `google-chrome-stable`, `xvfb`, `x11vnc`, `novnc`. On macOS, install PinchTab manually (`brew install pinchtab/tap/pinchtab`) and ensure Chrome is present.
+
+**Step 2 — Start the PinchTab server:**
+
+```bash
+# Standard headless mode
+bash scripts/start-pinchtab.sh
+
+# With live browser access for social/OAuth auth (Linux remote servers)
+bash scripts/start-pinchtab.sh --vnc --vnc-tunnel
+```
+
+The script starts Xvfb (Linux), detects Chrome, launches PinchTab, and prints a JSON object with `serverUrl`, `dashboardUrl`, and — when `--vnc` is used — `novncDirectUrl` and `vncPassword`.
+
+**Step 3 — Confirm the server is healthy:**
+
+```bash
+pinchtab health
+# or
+curl http://localhost:9867/health
+```
+
+**To stop everything:**
+
+```bash
+bash scripts/stop-pinchtab.sh
+```
+
+---
+
 Preferred tool surface:
 
 - Use `pinchtab` CLI commands first.
@@ -193,6 +233,89 @@ curl -X POST http://localhost:9868/action \
 ```
 
 If the server is exposed beyond localhost, require a token and use a dedicated automation profile. See [TRUST.md](./TRUST.md) and [config.md](../../docs/reference/config.md).
+
+### 6. Remote visual auth via NoVNC (socials, 2FA, CAPTCHA)
+
+Use this when Chrome is running on a remote or headless Linux server and the user must interact with the browser directly — social media login, OAuth consent screens, SMS/TOTP 2FA, image CAPTCHAs, or any flow that defeats automation.
+
+The stack: **Xvfb** gives Chrome a virtual display. **x11vnc** exposes that display over VNC. **NoVNC + websockify** wraps it in a browser-accessible HTTPS page. The user opens the page and interacts with the live Chrome window as if sitting at the machine.
+
+**Step 1 — Start with VNC enabled (and optionally a public tunnel):**
+
+```bash
+# Local server: human is on the same machine or same network
+scripts/start-pinchtab.sh --vnc
+
+# Remote/cloud server: expose NoVNC publicly via cloudflared
+scripts/start-pinchtab.sh --vnc --vnc-tunnel
+```
+
+The startup JSON output includes:
+- `novncDirectUrl` — open this in a browser to see Chrome live
+- `vncPassword` — the one-time VNC session password
+- `vncTunnelUrl` — public HTTPS URL (only when `--vnc-tunnel` is used)
+
+**Step 2 — Create a named profile for the social platform:**
+
+```bash
+curl -X POST http://localhost:9867/profiles \
+  -H "Content-Type: application/json" \
+  -d '{"name":"twitter","description":"Twitter/X automation"}'
+
+curl -X POST http://localhost:9867/profiles/twitter/start \
+  -H "Content-Type: application/json" \
+  -d '{"headless":false}'
+# Returns: {"port": 9868, ...}
+```
+
+**Step 3 — Navigate to the login page:**
+
+```bash
+pinchtab --server http://localhost:9868 nav https://x.com/login
+```
+
+**Step 4 — Hand off to the human:**
+
+Give the user the `novncDirectUrl` (with password pre-filled via `autoconnect=1&password=...`). The user opens it in any browser, sees Chrome, and completes login — including 2FA, SMS codes, OAuth consent, or CAPTCHA.
+
+**Step 5 — Detect auth completion by polling:**
+
+```bash
+# Poll until the page URL or content confirms login
+pinchtab --server http://localhost:9868 text
+```
+
+Watch for the post-login page (e.g., home feed, dashboard, redirect destination). Snapshot diffs work well here:
+
+```bash
+pinchtab --server http://localhost:9868 snap -d -i -c
+```
+
+**Step 6 — Switch to headless for automation:**
+
+Once the session is stored in the profile, restart it headless so the agent can automate at full speed without a display:
+
+```bash
+# Get the instance ID
+pinchtab instances
+
+pinchtab instance stop inst_abc123
+
+curl -X POST http://localhost:9867/profiles/twitter/start \
+  -H "Content-Type: application/json" \
+  -d '{"headless":true}'
+
+pinchtab --server http://localhost:9868 nav https://x.com/home
+pinchtab --server http://localhost:9868 text
+```
+
+The authenticated session is stored in the named profile and reused on every subsequent start — no re-login required.
+
+**Security notes:**
+- VNC binds to `127.0.0.1` only (`-localhost`). Only NoVNC (on the same host) can connect to it.
+- NoVNC also binds to `127.0.0.1` by default. The cloudflared tunnel is the only way to expose it externally, and it uses HTTPS.
+- The VNC password is a one-time random value generated at startup. Rotate it by restarting with `scripts/stop-pinchtab.sh` + `scripts/start-pinchtab.sh --vnc`.
+- The `vncPassword` field in the startup JSON is intentionally plaintext so the agent can communicate it to the user.
 
 ## Essential Commands
 

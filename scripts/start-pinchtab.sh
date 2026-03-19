@@ -15,6 +15,11 @@ else
 fi
 START_XVFB="${PINCHTAB_START_XVFB:-$DEFAULT_START_XVFB}"
 START_TUNNEL="${PINCHTAB_START_TUNNEL:-0}"
+START_VNC="${PINCHTAB_START_VNC:-0}"
+START_VNC_TUNNEL="${PINCHTAB_START_VNC_TUNNEL:-0}"
+VNC_PORT="${PINCHTAB_VNC_PORT:-$((5900 + DISPLAY_NUM))}"
+NOVNC_PORT="${PINCHTAB_NOVNC_PORT:-6080}"
+VNC_PASSWORD=""
 SERVER_URL="http://127.0.0.1:$PORT"
 HEALTH_URL="$SERVER_URL/health"
 DASHBOARD_URL="$SERVER_URL/dashboard"
@@ -28,6 +33,14 @@ while [ $# -gt 0 ]; do
       ;;
     --no-xvfb)
       START_XVFB=0
+      shift
+      ;;
+    --vnc)
+      START_VNC=1
+      shift
+      ;;
+    --vnc-tunnel)
+      START_VNC_TUNNEL=1
       shift
       ;;
     *)
@@ -214,33 +227,169 @@ read_tunnel_url() {
   done
 }
 
+ensure_x11vnc() {
+  if [ "$START_VNC" != "1" ]; then
+    return
+  fi
+
+  if [ "$(uname -s)" != "Linux" ]; then
+    echo "Warning: --vnc is only supported on Linux (Xvfb required)." >&2
+    return
+  fi
+
+  if [ "$START_XVFB" != "1" ]; then
+    echo "Warning: --vnc requires Xvfb. Do not combine with --no-xvfb." >&2
+    return
+  fi
+
+  if ! command -v x11vnc >/dev/null 2>&1; then
+    echo "Warning: x11vnc not found. Run scripts/install-deps.sh first." >&2
+    return
+  fi
+
+  if [ -f "$PID_DIR/x11vnc.pid" ] && kill -0 "$(cat "$PID_DIR/x11vnc.pid")" 2>/dev/null; then
+    return
+  fi
+
+  local passwd_file="$PID_DIR/vnc.passwd"
+  VNC_PASSWORD="$(openssl rand -base64 9 | tr '/+' 'XY' | tr -d '\n=')"
+  x11vnc -storepasswd "$VNC_PASSWORD" "$passwd_file" 2>/dev/null
+  chmod 600 "$passwd_file"
+
+  nohup x11vnc \
+    -display "$DISPLAY_VAR" \
+    -rfbport "$VNC_PORT" \
+    -rfbauth "$passwd_file" \
+    -forever \
+    -shared \
+    -localhost \
+    -quiet \
+    >"$LOG_DIR/x11vnc.log" 2>&1 &
+  echo $! >"$PID_DIR/x11vnc.pid"
+  sleep 1
+
+  if ! kill -0 "$(cat "$PID_DIR/x11vnc.pid")" 2>/dev/null; then
+    echo "Warning: x11vnc may not have started. Check $LOG_DIR/x11vnc.log" >&2
+    VNC_PASSWORD=""
+  fi
+}
+
+find_novnc_proxy() {
+  for candidate in \
+    /usr/bin/novnc_proxy \
+    /usr/share/novnc/utils/novnc_proxy \
+    /usr/share/novnc/utils/launch.sh; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  command -v novnc_proxy 2>/dev/null || true
+}
+
+ensure_novnc() {
+  if [ "$START_VNC" != "1" ] || [ -z "$VNC_PASSWORD" ]; then
+    return
+  fi
+
+  if [ -f "$PID_DIR/novnc.pid" ] && kill -0 "$(cat "$PID_DIR/novnc.pid")" 2>/dev/null; then
+    return
+  fi
+
+  local novnc_bin
+  novnc_bin="$(find_novnc_proxy)"
+  if [ -z "$novnc_bin" ]; then
+    echo "Warning: novnc_proxy not found. Install the novnc package." >&2
+    return
+  fi
+
+  nohup "$novnc_bin" \
+    --vnc "127.0.0.1:$VNC_PORT" \
+    --listen "$NOVNC_PORT" \
+    >"$LOG_DIR/novnc.log" 2>&1 &
+  echo $! >"$PID_DIR/novnc.pid"
+  sleep 1
+}
+
+start_vnc_tunnel() {
+  if [ "$START_VNC_TUNNEL" != "1" ] || [ -z "$VNC_PASSWORD" ]; then
+    return
+  fi
+
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    echo "Warning: cloudflared not found; cannot start VNC tunnel." >&2
+    return
+  fi
+
+  if [ -f "$PID_DIR/cloudflared-vnc.pid" ] && kill -0 "$(cat "$PID_DIR/cloudflared-vnc.pid")" 2>/dev/null; then
+    return
+  fi
+
+  nohup cloudflared tunnel \
+    --url "http://127.0.0.1:$NOVNC_PORT" \
+    --config /dev/null \
+    >"$LOG_DIR/cloudflared-vnc.log" 2>&1 &
+  echo $! >"$PID_DIR/cloudflared-vnc.pid"
+}
+
+read_vnc_tunnel_url() {
+  if [ "$START_VNC_TUNNEL" != "1" ] || [ -z "$VNC_PASSWORD" ]; then
+    return
+  fi
+  for _ in $(seq 1 20); do
+    local url
+    url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_DIR/cloudflared-vnc.log" 2>/dev/null | head -1 || true)"
+    if [ -n "$url" ]; then
+      echo "$url"
+      return
+    fi
+    sleep 1
+  done
+}
+
 sync_browser_env
 detect_linux_chrome
 sync_browser_env
 ensure_pinchtab
 ensure_xvfb
+ensure_x11vnc
+ensure_novnc
 start_orchestrator
 start_tunnel
+start_vnc_tunnel
 
 TUNNEL_URL="$(read_tunnel_url || true)"
+VNC_TUNNEL_URL="$(read_vnc_tunnel_url || true)"
+
+# Build NoVNC direct URL with auto-connect and pre-filled password
+NOVNC_BASE_URL=""
+NOVNC_DIRECT_URL=""
+if [ -n "$VNC_PASSWORD" ]; then
+  if [ -n "$VNC_TUNNEL_URL" ]; then
+    NOVNC_BASE_URL="${VNC_TUNNEL_URL}/vnc.html"
+  else
+    NOVNC_BASE_URL="http://127.0.0.1:${NOVNC_PORT}/vnc.html"
+  fi
+  NOVNC_DIRECT_URL="${NOVNC_BASE_URL}?autoconnect=1&password=${VNC_PASSWORD}"
+fi
+
+add_pid() {
+  local name="$1"
+  local file="$PID_DIR/${name}.pid"
+  if [ -f "$file" ]; then
+    if [ -n "$PID_LINES" ]; then PID_LINES="${PID_LINES},
+"; fi
+    PID_LINES="${PID_LINES}    \"${name}\": $(cat "$file")"
+  fi
+}
+
 PID_LINES=""
-if [ -f "$PID_DIR/pinchtab.pid" ]; then
-  PID_LINES="    \"pinchtab\": $(cat "$PID_DIR/pinchtab.pid")"
-fi
-if [ -f "$PID_DIR/xvfb.pid" ]; then
-  if [ -n "$PID_LINES" ]; then
-    PID_LINES="${PID_LINES},
-"
-  fi
-  PID_LINES="${PID_LINES}    \"xvfb\": $(cat "$PID_DIR/xvfb.pid")"
-fi
-if [ -f "$PID_DIR/cloudflared.pid" ]; then
-  if [ -n "$PID_LINES" ]; then
-    PID_LINES="${PID_LINES},
-"
-  fi
-  PID_LINES="${PID_LINES}    \"cloudflared\": $(cat "$PID_DIR/cloudflared.pid")"
-fi
+add_pid pinchtab
+add_pid xvfb
+add_pid x11vnc
+add_pid novnc
+add_pid cloudflared
+add_pid cloudflared-vnc
 
 cat <<EOF
 {
@@ -254,6 +403,11 @@ cat <<EOF
   "chromeBin": "${CHROME_BIN:-${CHROME_BINARY:-}}",
   "serverAlreadyRunning": $([ "$SERVER_ALREADY_RUNNING" = "1" ] && echo "true" || echo "false"),
   "tunnelUrl": "${TUNNEL_URL:-}",
+  "vncEnabled": $([ -n "$VNC_PASSWORD" ] && echo "true" || echo "false"),
+  "novncUrl": "${NOVNC_BASE_URL:-}",
+  "novncDirectUrl": "${NOVNC_DIRECT_URL:-}",
+  "vncPassword": "${VNC_PASSWORD:-}",
+  "vncTunnelUrl": "${VNC_TUNNEL_URL:-}",
   "pids": {
 ${PID_LINES}
   }

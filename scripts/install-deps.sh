@@ -31,13 +31,19 @@ install_linux_browser_deps() {
   if ! command -v Xvfb >/dev/null 2>&1; then
     need_update=1
   fi
+  if ! command -v x11vnc >/dev/null 2>&1; then
+    need_update=1
+  fi
+  if ! command -v novnc_proxy >/dev/null 2>&1 && ! [ -x /usr/share/novnc/utils/novnc_proxy ]; then
+    need_update=1
+  fi
 
   if [ "$need_update" -eq 0 ]; then
-    echo "  ✓ Chrome + Xvfb already available"
+    echo "  ✓ Chrome + Xvfb + x11vnc + novnc already available"
     return
   fi
 
-  echo "  → Installing Chrome + Xvfb on apt-based Linux"
+  echo "  → Installing Chrome + Xvfb + x11vnc + novnc on apt-based Linux"
   sudo mkdir -p /etc/apt/keyrings
   if [ ! -f /etc/apt/keyrings/google-chrome.gpg ]; then
     curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
@@ -50,7 +56,7 @@ install_linux_browser_deps() {
   fi
 
   sudo apt-get update -qq
-  sudo apt-get install -y google-chrome-stable xvfb
+  sudo apt-get install -y google-chrome-stable xvfb x11vnc novnc
 }
 
 verify_optional() {
@@ -84,13 +90,26 @@ elif command -v chromium >/dev/null 2>&1; then
 elif command -v chromium-browser >/dev/null 2>&1; then
   echo "  ✓ chromium-browser: $(command -v chromium-browser)"
 else
-  echo "  · Chrome/Chromium not found"
+  echo "  ✗ missing: Chrome/Chromium (required for browser automation)"
+  missing=1
 fi
 
 if command -v Xvfb >/dev/null 2>&1; then
   echo "  ✓ Xvfb: $(command -v Xvfb)"
 else
   echo "  · Xvfb not found (needed for headed workflows on headless Linux)"
+fi
+
+if command -v x11vnc >/dev/null 2>&1; then
+  echo "  ✓ x11vnc: $(command -v x11vnc)"
+else
+  echo "  · x11vnc not found (optional; needed for --vnc remote visual auth)"
+fi
+
+if command -v novnc_proxy >/dev/null 2>&1 || [ -x /usr/share/novnc/utils/novnc_proxy ]; then
+  echo "  ✓ novnc: found"
+else
+  echo "  · novnc not found (optional; needed for --vnc remote visual auth)"
 fi
 
 verify_optional

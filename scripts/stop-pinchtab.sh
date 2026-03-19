@@ -32,6 +32,9 @@ stop_pid() {
   rm -f "$file"
 }
 
+stop_pid cloudflared-vnc
+stop_pid novnc
+stop_pid x11vnc
 stop_pid cloudflared
 stop_pid pinchtab
 stop_pid xvfb
